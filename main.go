@@ -31,7 +31,11 @@ var (
 
 func main() {
 	ctx := context.Background()
-	createClient()
+	err := createClient()
+	if err != nil {
+		panic(err)
+	}
+
 	imageName, err := reference.ParseNormalizedNamed(pgImage)
 	if err != nil {
 		fmt.Println("Unable to normalize name")
@@ -39,8 +43,16 @@ func main() {
 	}
 	fullName := imageName.String()
 
-	pullContainer(ctx, fullName)
-	container, _ := createNewContainer(ctx, fullName)
+	err = pullContainer(ctx, fullName)
+	if err != nil {
+		panic(err)
+	}
+
+	container, err := createNewContainer(ctx, fullName)
+	if err != nil {
+		panic(err)
+	}
+
 	defer removeContainer(ctx, container.ID)
 
 	// Print logs from the container
@@ -60,7 +72,10 @@ func main() {
 
 	serverHost := "127.0.0.1"
 	serverPort := "5432"
-	waitForPort(fmt.Sprintf("%s:%s", serverHost, serverPort))
+	err = waitForPort(fmt.Sprintf("%s:%s", serverHost, serverPort))
+	if err != nil {
+		panic(err)
+	}
 
 	fmt.Println("connecting DB")
 	// sqlx.Connect calls Ping() and will fail when the DB is not ready, so
@@ -77,34 +92,35 @@ func main() {
 
 }
 
-func createClient() {
+func createClient() error {
 	var err error
 	cli, err = client.NewEnvClient()
 	if err != nil {
-		fmt.Println("Unable to create docker client")
-		panic(err)
+		return fmt.Errorf("unable to create docker client: %w", err)
 	}
+	return nil
 }
 
-func pullContainer(ctx context.Context, image string) {
+func pullContainer(ctx context.Context, image string) error {
 	// TODO: cli.ImageList() to only download if not available
 	out, err := cli.ImagePull(ctx, image, types.ImagePullOptions{})
 	if err != nil {
-		panic(err)
+		return fmt.Errorf("unable to pull image: %w", err)
 	}
 	defer out.Close()
 
 	io.Copy(os.Stdout, out)
+	return nil
 }
 
-func createNewContainer(ctx context.Context, image string) (container.ContainerCreateCreatedBody, error) {
+func createNewContainer(ctx context.Context, image string) (*container.ContainerCreateCreatedBody, error) {
 	hostBinding := nat.PortBinding{
 		HostIP:   "0.0.0.0",
 		HostPort: "5432",
 	}
 	containerPort, err := nat.NewPort("tcp", "5432")
 	if err != nil {
-		panic("Unable to get the port")
+		return nil, fmt.Errorf("unable to get the port: %w", err)
 	}
 
 	portBinding := nat.PortMap{containerPort: []nat.PortBinding{hostBinding}}
@@ -120,19 +136,19 @@ func createNewContainer(ctx context.Context, image string) (container.ContainerC
 
 	err = cli.ContainerStart(ctx, cont.ID, types.ContainerStartOptions{})
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("unable to start the container: %w", err)
 	}
-	fmt.Printf("Container %s is started\n", cont.ID)
-	return cont, nil
+	fmt.Printf("container %s is started\n", cont.ID)
+	return &cont, nil
 }
 
-func removeContainer(ctx context.Context, id string) {
-	fmt.Printf("Container %s is shutting down\n", id)
+func removeContainer(ctx context.Context, id string) error {
+	fmt.Printf("container %s is stopping\n", id)
 	err := cli.ContainerStop(ctx, id, &defaultTimeout)
 	if err != nil {
-		panic(err)
+		return fmt.Errorf("failed stopping container: %w", err)
 	}
-	fmt.Printf("Container %s is stopped\n", id)
+	fmt.Printf("container %s is stopped\n", id)
 
 	err = cli.ContainerRemove(ctx, id, types.ContainerRemoveOptions{
 		RemoveVolumes: true,
@@ -142,34 +158,40 @@ func removeContainer(ctx context.Context, id string) {
 		Force:       false,
 	})
 	if err != nil {
-		panic(err)
+		return fmt.Errorf("failed removing container: %w", err)
 	}
-	fmt.Printf("Container %s is removed\n", id)
-
+	fmt.Printf("container %s is removed\n", id)
+	return nil
 }
 
-func waitForPort(addr string) {
+func waitForPort(addr string) error {
 	count := 0
-	fmt.Println("Checking for open port")
+	fmt.Println("checking for open port")
 
 	conn, err := net.DialTimeout("tcp", addr, 1*time.Second)
 	for err != nil {
 		count++
 		if count > 10 {
-			fmt.Printf("Can't connect to server: %s\n", err)
-			return
+			return fmt.Errorf("cannot connect to server: %w", err)
 		}
 		time.Sleep(100 * time.Millisecond)
-		fmt.Println("Retrying Port")
+		fmt.Println("retrying Port")
 		conn, err = net.DialTimeout("tcp", addr, 1*time.Second)
 	}
 	conn.Close()
-	fmt.Println("Port connected")
+	fmt.Println("port connected")
+	return nil
 }
 
 func pingDB(ctx context.Context, db *sqlx.DB) error {
 	fmt.Println("pinging DB")
 	err := db.PingContext(ctx)
+
+	retry := func(err error) error {
+		fmt.Printf("%#v: %s\n", err, err)
+		time.Sleep(250 * time.Millisecond)
+		return db.PingContext(ctx)
+	}
 
 	for err != nil {
 		fmt.Printf("%#v\n", db.Stats())
@@ -180,26 +202,20 @@ func pingDB(ctx context.Context, db *sqlx.DB) error {
 		// ready.
 		var errNo syscall.Errno
 		if errors.As(err, &errNo) {
-			fmt.Printf("%#v: %s\n", errNo, errNo)
 			if errNo == 0x68 { //"connection reset by peer" on Linux
-				time.Sleep(250 * time.Millisecond)
-				err = db.PingContext(ctx)
+				err = retry(errNo)
 				continue
 			}
 		}
 		if err == io.EOF {
-			fmt.Printf("%#v: %s\n", err, err)
-			time.Sleep(250 * time.Millisecond)
-			err = db.PingContext(ctx)
+			err = retry(errNo)
 			continue
 		}
 		var errPq *pq.Error
 		if errors.As(err, &errPq) {
 			// "the database system is starting up"
 			if errPq.Code == "57P03" {
-				fmt.Printf("%#v: %s\n", errPq, errPq)
-				time.Sleep(250 * time.Millisecond)
-				err = db.PingContext(ctx)
+				err = retry(errNo)
 				continue
 			}
 		}
