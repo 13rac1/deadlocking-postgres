@@ -6,22 +6,21 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"syscall"
 	"time"
 
-	"github.com/docker/distribution/reference"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
-	"github.com/docker/go-connections/nat"
 	"github.com/jmoiron/sqlx"
 	"github.com/lib/pq"
 	_ "github.com/lib/pq"
 )
 
 const (
-	pgImage = "postgres:9.4-alpine"
+	pgImage         = "postgres:9.4-alpine"
+	pgContainerName = "postgres"
+	pgContainerPort = "5432"
+	pgHostPort      = "5432"
+	pgPassword      = "postgres"
 )
 
 var (
@@ -31,50 +30,37 @@ var (
 
 func main() {
 	ctx := context.Background()
-	err := createClient()
+	docker, err := newDockerClient()
 	if err != nil {
 		panic(err)
 	}
-
-	imageName, err := reference.ParseNormalizedNamed(pgImage)
-	if err != nil {
-		fmt.Println("Unable to normalize name")
-		panic(err)
-	}
-	fullName := imageName.String()
-
-	err = pullContainer(ctx, fullName)
-	if err != nil {
-		panic(err)
-	}
-
-	container, err := createNewContainer(ctx, fullName)
-	if err != nil {
-		panic(err)
-	}
-
-	defer removeContainer(ctx, container.ID)
-
-	// Print logs from the container
-	go func() {
-		out, err := cli.ContainerLogs(ctx, container.ID, types.ContainerLogsOptions{
-			ShowStdout: true,
-			ShowStderr: true,
-			Follow:     true,
-			Timestamps: true,
-		})
-		if err != nil {
-			panic(err)
-		}
-		//io.Copy(os.Stdout, out)
-		defer out.Close()
-	}()
 
 	serverHost := "127.0.0.1"
 	serverPort := "5432"
-	err = waitForPort(fmt.Sprintf("%s:%s", serverHost, serverPort))
+	addr := fmt.Sprintf("%s:%s", serverHost, serverPort)
+	ports := map[string]string{"5432": "5432"}
+	env := []string{"POSTGRES_PASSWORD=postgres"}
+
+	pgContainer, err := docker.runContainer(ctx, pgImage, ports, env)
 	if err != nil {
+		fmt.Println("error running container")
 		panic(err)
+	}
+
+	defer docker.removeContainer(ctx, pgContainer.ID)
+	go docker.printLogs(ctx, pgContainer.ID)
+
+	err = waitForPostgresReady(ctx, addr)
+	if err != nil {
+		fmt.Println("failed waiting on Postgres")
+		panic(err)
+	}
+}
+
+func waitForPostgresReady(ctx context.Context, addr string) error {
+	err := waitForPort(addr)
+	if err != nil {
+		return err
 	}
 
 	fmt.Println("connecting DB")
@@ -82,85 +68,13 @@ func main() {
 	// manually ping the DB until ready.
 	db, err := sqlx.Open("postgres", "postgres://postgres:postgres@localhost/postgres?sslmode=disable")
 	if err != nil {
-		panic(err)
+		return err
 	}
 
 	err = pingDB(ctx, db)
 	if err != nil {
-		panic(err)
+		return err
 	}
-
-}
-
-func createClient() error {
-	var err error
-	cli, err = client.NewEnvClient()
-	if err != nil {
-		return fmt.Errorf("unable to create docker client: %w", err)
-	}
-	return nil
-}
-
-func pullContainer(ctx context.Context, image string) error {
-	// TODO: cli.ImageList() to only download if not available
-	out, err := cli.ImagePull(ctx, image, types.ImagePullOptions{})
-	if err != nil {
-		return fmt.Errorf("unable to pull image: %w", err)
-	}
-	defer out.Close()
-
-	io.Copy(os.Stdout, out)
-	return nil
-}
-
-func createNewContainer(ctx context.Context, image string) (*container.ContainerCreateCreatedBody, error) {
-	hostBinding := nat.PortBinding{
-		HostIP:   "0.0.0.0",
-		HostPort: "5432",
-	}
-	containerPort, err := nat.NewPort("tcp", "5432")
-	if err != nil {
-		return nil, fmt.Errorf("unable to get the port: %w", err)
-	}
-
-	portBinding := nat.PortMap{containerPort: []nat.PortBinding{hostBinding}}
-	cont, err := cli.ContainerCreate(
-		ctx,
-		&container.Config{
-			Image: image,
-			Env:   []string{"POSTGRES_PASSWORD=postgres"},
-		},
-		&container.HostConfig{
-			PortBindings: portBinding,
-		}, nil, "")
-
-	err = cli.ContainerStart(ctx, cont.ID, types.ContainerStartOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("unable to start the container: %w", err)
-	}
-	fmt.Printf("container %s is started\n", cont.ID)
-	return &cont, nil
-}
-
-func removeContainer(ctx context.Context, id string) error {
-	fmt.Printf("container %s is stopping\n", id)
-	err := cli.ContainerStop(ctx, id, &defaultTimeout)
-	if err != nil {
-		return fmt.Errorf("failed stopping container: %w", err)
-	}
-	fmt.Printf("container %s is stopped\n", id)
-
-	err = cli.ContainerRemove(ctx, id, types.ContainerRemoveOptions{
-		RemoveVolumes: true,
-		// RemoveLinks=true causes "Error response from daemon: Conflict, cannot
-		// remove the default name of the container"
-		RemoveLinks: false,
-		Force:       false,
-	})
-	if err != nil {
-		return fmt.Errorf("failed removing container: %w", err)
-	}
-	fmt.Printf("container %s is removed\n", id)
 	return nil
 }
 
